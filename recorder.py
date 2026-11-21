@@ -19,6 +19,16 @@ OUT_DIR = os.environ.get("OUT_DIR", "./streams")
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "./cookies.txt")
 REQUIRE_COOKIES = True
 
+# Continuation & Zero-Gap Prewarm Configuration
+SHIFTS_LEFT = int(os.environ.get("SHIFTS_LEFT", "0") or 0)
+ALWAYS_CONTINUE = os.environ.get("ALWAYS_CONTINUE", "true").lower() == "true"
+PREWARM_LEAD_SECONDS = int(os.environ.get("PREWARM_LEAD_SECONDS", "600"))  # 10m prewarm buffer
+PREWARM_MAX_ATTEMPTS = 2
+PREWARM_BACKOFF_SECONDS = 60
+CONTINUATION_DISPATCHED = False
+PREWARM_ATTEMPTS = 0
+NEXT_PREWARM_AT = 0.0
+
 CHECK_SECONDS = 30
 HEARTBEAT_SECONDS = 15
 STALL_SECONDS = 180
@@ -28,7 +38,7 @@ MIN_SAVE_BYTES = 1_000_000
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/110.0.0.0 Safari/537.36"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
 BLOCK_MARKERS = ["cloudflare", "captcha", "forbidden", "http error 403", "403"]
@@ -76,6 +86,7 @@ SUMMARY = {
     "failure_reason": None,
     "recorded_files": [],
     "total_size_mb": 0.0,
+    "continuation_dispatched": False,
 }
 
 def write_summary(**updates):
@@ -85,6 +96,71 @@ def write_summary(**updates):
             json.dump(SUMMARY, fh, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+def dispatch_tokens():
+    tokens = []
+    for name in ("GH_TOKEN", "GH_FALLBACK_TOKEN", "GITHUB_TOKEN"):
+        value = os.getenv(name, "").strip()
+        if value and value not in tokens:
+            tokens.append(value)
+    return tokens
+
+def maybe_prewarm_continuation_shift():
+    global CONTINUATION_DISPATCHED, PREWARM_ATTEMPTS, NEXT_PREWARM_AT
+    now = time.time()
+    if (
+        CONTINUATION_DISPATCHED
+        or SHIFTS_LEFT <= 0
+        or HOURS < 0.1
+        or PREWARM_ATTEMPTS >= PREWARM_MAX_ATTEMPTS
+        or now < NEXT_PREWARM_AT
+    ):
+        return
+
+    gh_bin = shutil.which("gh")
+    tokens = dispatch_tokens()
+    if not gh_bin or not tokens:
+        PREWARM_ATTEMPTS = PREWARM_MAX_ATTEMPTS
+        write_summary(continuation_dispatched=False)
+        log("prewarm_skipped | gh or token unavailable; deferring to workflow post-run step")
+        return
+
+    PREWARM_ATTEMPTS += 1
+    NEXT_PREWARM_AT = now + PREWARM_BACKOFF_SECONDS
+
+    ref_name = os.getenv("GITHUB_REF_NAME", "main")
+    repo = os.getenv("GITHUB_REPOSITORY")
+    next_shifts = str(max(0, SHIFTS_LEFT - 1))
+
+    cmd = [
+        gh_bin, "workflow", "run", "record.yml",
+        "--ref", ref_name,
+        "-f", f"hours={HOURS}",
+        "-f", f"shifts_left={next_shifts}",
+        "-f", f"always_continue={'true' if ALWAYS_CONTINUE else 'false'}",
+        "-f", f"channel={CHANNEL_HANDLE}",
+    ]
+    if repo:
+        cmd.extend(["--repo", repo])
+
+    last_error = ""
+    for position, token in enumerate(tokens, start=1):
+        env = dict(os.environ, GH_TOKEN=token)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=25, env=env)
+        except Exception as exc:
+            last_error = f"token#{position} exception: {exc}"
+            continue
+        if res.returncode == 0:
+            CONTINUATION_DISPATCHED = True
+            log(f"prewarm_continuation_dispatched | attempt={PREWARM_ATTEMPTS} | token#{position} | shifts_left={next_shifts} | channel={CHANNEL_HANDLE}")
+            write_summary(continuation_dispatched=True)
+            return
+        last_error = f"token#{position} rc={res.returncode} {res.stderr.strip()}"
+        log_raw("prewarm_dispatch_token_failed", last_error)
+
+    write_summary(continuation_dispatched=False)
+    log_raw("prewarm_dispatch_failed", f"attempt={PREWARM_ATTEMPTS}/{PREWARM_MAX_ATTEMPTS} | {last_error}")
 
 try:
     from curl_cffi import requests
@@ -267,7 +343,7 @@ def ytdlp_live_probe():
     return None
 
 def get_live():
-    return api_live_probe() or ytdlp_live_probe()
+    return ytdlp_live_probe() or api_live_probe()
 
 STOP_REQUESTED = False
 CURRENT_PROC = None
@@ -275,17 +351,6 @@ CURRENT_PROC = None
 def stop_proc(proc):
     if not proc or proc.poll() is not None:
         return
-    if os.name == "posix":
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=8)
-            return
-        except Exception:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                pass
-            return
     proc.terminate()
     try:
         proc.wait(timeout=8)
@@ -373,7 +438,6 @@ def make_download_cmd(url, final_ts):
         "--retry-sleep", "fragment:1",
         "--hls-use-mpegts",
         "--downloader", "ffmpeg",
-        "--downloader-args", "ffmpeg:-loglevel warning -nostats",
         "-N", "1",
         "-f", "best[height<=720]/bestvideo[height<=720]+bestaudio/best",
         "-o", final_ts,
@@ -387,7 +451,7 @@ def run_download(url, final_ts, session_end, source_label):
     log(f"[{hms(session_end - time.time())} left] download_started | source={source_label} | url={url[:80]}")
     write_summary(status="download_started", failure_reason=None)
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="ignore", start_new_session=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, encoding="utf-8", errors="ignore")
     CURRENT_PROC = proc
 
     state = {"blocked": False, "auth": False, "not_live": False}
@@ -407,6 +471,12 @@ def run_download(url, final_ts, session_end, source_label):
         if size_bytes > last_size:
             last_size = size_bytes
             last_growth_at = now
+
+        # In-Flight Prewarm Check: trigger next shift 10m before end so next runner boots & begins capturing
+        if (session_end - now) <= PREWARM_LEAD_SECONDS and (
+            ALWAYS_CONTINUE or (last_size >= MIN_SAVE_BYTES and (now - last_growth_at) <= 180)
+        ):
+            maybe_prewarm_continuation_shift()
 
         if now - last_heartbeat >= HEARTBEAT_SECONDS:
             if path and os.path.exists(path):
@@ -480,6 +550,10 @@ try:
             continue
 
         if now >= next_check:
+            # Prewarm continuation shift while monitoring offline
+            if ALWAYS_CONTINUE and (session_end - now) <= PREWARM_LEAD_SECONDS:
+                maybe_prewarm_continuation_shift()
+
             live = get_live()
             next_check = time.time() + CHECK_SECONDS
             if not live:
@@ -510,6 +584,6 @@ try:
 finally:
     stop_proc(CURRENT_PROC)
 
-log("Session complete.")
-write_summary(status="session_complete")
+log(f"Session complete. Continuation prewarm dispatched: {CONTINUATION_DISPATCHED}")
+write_summary(status="session_complete", continuation_dispatched=CONTINUATION_DISPATCHED)
 print(OUT_DIR)
